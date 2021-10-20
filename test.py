@@ -1,0 +1,291 @@
+# -*- coding:utf-8 -*-
+import argparse
+from collections import OrderedDict
+from pathlib import Path
+import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
+from citylearn import CityLearn
+
+from agent import RL_Agents
+from utils.io import get_output_folder
+from utils.standardization import normalize_state
+from reward_function import reward_function
+
+parser = argparse.ArgumentParser()
+
+# RL Hyper-parameters
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--MAX_BUFFER', type=int, default=10000)
+parser.add_argument('--seed', '-s', type=int, default=0)
+parser.add_argument('--BATCH_SIZE', type=int, default=32)
+parser.add_argument('--climate_zone', type=int, default=1)
+parser.add_argument('--act_limit', type=float, default=0.5)
+parser.add_argument('--decay', type=float, default=1)
+
+# TCN Hyper-parameters
+parser.add_argument('--encode_dim', type=int, default=64)
+parser.add_argument('--num_layers', type=int, default=1)
+parser.add_argument('--alpha', type=float, default=0.2)
+
+parser.add_argument('--kernel_size', type=int, default=3)
+parser.add_argument('--kernel_size_forecast', type=int, default=3)
+
+parser.add_argument('--levels', type=int, default=5)
+parser.add_argument('--levels_forecast', type=int, default=3)
+
+parser.add_argument('--seq_len', type=int, default=24)
+parser.add_argument('--seq_len_forecast', type=int, default=6)
+
+parser.add_argument('--episode_len', type=int, default=168)
+
+# reward Hyper-parameters
+parser.add_argument('--A_r', type=float, default=0)
+parser.add_argument('--B_r', type=float, default=1)
+parser.add_argument('--window_len_A', type=int, default=6)
+parser.add_argument('--window_len_B', type=int, default=12)
+parser.add_argument('--price_factor', type=float, default=0.01)
+
+# logger
+parser.add_argument('--print_per_step', type=int, default=250)
+
+# load model
+parser.add_argument('--continue_flag', type=int, default=1)
+parser.add_argument('--load_episode', type=int, default=295)
+
+# training length
+parser.add_argument('--MaxEpisode', type=int, default=100000)
+parser.add_argument('--save_per_episode', type=int, default=500)
+parser.add_argument('--train', dest='train', default=True, action='store_true')
+parser.add_argument('--eval', dest='train', action='store_false')
+parser.add_argument('--suffix', type=str, default="")
+
+args = parser.parse_args()
+
+reward_kwargs = OrderedDict(
+    alpha=args.A_r,
+    beta=args.B_r,
+    total_energy_window=args.window_len_A,
+    heat_energy_window=args.window_len_B,
+    price_factor=args.price_factor,
+    ramping_window=6
+)
+
+full_dim = 33
+src_dim = 21
+pred_dim = 4
+latent_dim = 3
+act_dim = 2
+
+
+# Load Model using args dict
+def get_agent_kwargs(args, log_path, train=None):
+    # Lazy Import
+    from model.BaseModules import ActionClipping
+    from model.Encoder import ROMAEncoder, ROMALSTMEncoder
+    from model.RLModules import DualHyperQNet, SGHNActor, MLP
+
+    encode_dim = args.encode_dim
+    encoder_kwargs = (ROMAEncoder,
+                      OrderedDict(  # for ROMAEncoder
+                          input_size=33,
+                          output_size=encode_dim,
+                          role_size=latent_dim,
+                          rnn_kwarg=OrderedDict(num_layers=args.num_layers))
+                      )
+
+    model_kwargs = OrderedDict(
+        Encoder=encoder_kwargs,
+        DualCritic=(DualHyperQNet,
+                    OrderedDict(input_size=encode_dim, latent_size=latent_dim,
+                                action_size=act_dim)),
+        Actor=(SGHNActor,
+               OrderedDict(input_size=encode_dim, output_size=act_dim, latent_size=latent_dim)),
+        DisparityNet=(MLP,
+                      OrderedDict(input_size=latent_dim * 2, output_size=1, layer_sizes=[encode_dim],
+                                  norm_layer=nn.BatchNorm1d, activation=nn.LeakyReLU())),
+    )
+
+    default_lr = args.lr
+    action_clip_kwargs = OrderedDict(
+        start_bound=args.act_limit,
+        stop_bound=.1,
+        decay=args.decay,
+        step_size=20000,
+        warm_up=0,
+        verbose=True
+    )
+    # print("act limit:", action_clip_kwargs['start_bound)
+
+    if train is None:
+        train = args.train
+
+    if not train:
+        algo_kwargs = None
+        print("eval mode, use deterministic policy")
+    else:
+        unique_optim_kwargs = OrderedDict(
+            Encoder=OrderedDict(),
+            DualCritic=OrderedDict(),
+            Actor=OrderedDict()
+        )
+        algo_kwargs = OrderedDict(
+            batch_size=args.BATCH_SIZE,
+            alpha=args.alpha,
+            buffer_capacity=args.MAX_BUFFER,
+            optim_cls=torch.optim.Adam,
+            optim_kwargs=OrderedDict(lr=default_lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0),
+            unique_optim_kwargs=unique_optim_kwargs,
+            verbose=True,
+            log_interval=args.print_per_step,
+            log_path=log_path
+        )
+
+    ac_kwargs = dict(
+        model_kwargs=model_kwargs,
+        algo_kwargs=algo_kwargs,
+        # state_fn=lambda s: normalize_seq2seq_state_forRL(s, future_len=args.seq_len_forecast),
+        state_fn=normalize_state,
+        # No reward_fn for Hierarchical Agents # TODO Compatibility with original agent
+        reward_fn=None,
+        action_clipping=lambda model: ActionClipping(model, **action_clip_kwargs),
+        memory_size=args.seq_len
+    )
+
+    return ac_kwargs
+
+
+filename = "zone_" + str(args.climate_zone) + \
+           "_lr" + str(args.lr) + \
+           "_predLen_" + str(args.seq_len_forecast) + \
+           "_actlimit" + str(args.act_limit) + \
+           "_num_layers_" + str(args.num_layers) + \
+           "_encode_" + str(args.encode_dim) + \
+           "_episodeLen_" + str(args.episode_len) + \
+           "_seqLen_" + str(args.seq_len) + \
+           "_decay_" + str(args.decay) + \
+           "_" + str(args.suffix)
+
+# Instantiating the Tensorboard writers
+PATH_base = 'test/'
+PATH_base = get_output_folder(PATH_base, 'scalar_' + filename)
+
+# for eval stage
+reward_writer = SummaryWriter(PATH_base + '/reward')
+cost_writer = SummaryWriter(PATH_base + '/cost')
+act_writer = SummaryWriter(PATH_base + '/act')
+soc_writer = SummaryWriter(PATH_base + '/soc')
+
+# load data
+data_path = Path("../data/Climate_Zone_" + str(args.climate_zone))
+building_attributes = data_path / 'building_attributes.json'
+weather_file = data_path / 'weather_data.csv'
+solar_profile = data_path / 'solar_generation_1kW.csv'
+building_state_actions = 'buildings_state_action_space.json'
+building_ids = ["Building_1", "Building_2", "Building_3", "Building_4", "Building_5", "Building_6", "Building_7",
+                "Building_8", "Building_9"]
+objective_function = ['ramping', '1-load_factor', 'average_daily_peak', 'peak_demand',
+                      'net_electricity_consumption', 'total']
+
+# Alias
+Env = CityLearn
+# Instantiating the env
+env = Env(data_path, building_attributes, weather_file, solar_profile, building_ids,
+          buildings_states_actions=building_state_actions, cost_function=objective_function)
+observations_spaces, actions_spaces = env.get_state_action_spaces()
+
+# Provides information on Building type, Climate Zone, Annual DHW demand, Annual Cooling Demand,
+# Annual Electricity Demand, Solar Capacity, and correllations among buildings
+building_info = env.get_building_information()
+
+# Select many episodes for training. In the final run we will set this value to 1 (the buildings run for one year)
+start_episode = 0
+
+ac_kwargs = get_agent_kwargs(args, PATH_base)
+# rl_agents = RL_Agents(building_info, observations_spaces, actions_spaces, ac_kwargs)
+
+# initialize the model
+best_model_path = "./Models_best_zone" + str(args.climate_zone)
+
+model_path = './Models_' + filename
+if not os.path.isdir(model_path):
+    os.mkdir(model_path)
+
+env_kwargs = dict(
+    data_path=data_path,
+    building_attributes=building_attributes,
+    weather_file=weather_file,
+    solar_profile=solar_profile,
+    building_ids=building_ids,
+    buildings_states_actions=building_state_actions,
+    cost_function=objective_function
+)
+reward_fn = reward_function
+
+MaxEpisode = args.MaxEpisode
+
+
+def print_grad(model):
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(name, param)
+
+
+def print_weight(model):
+    print(list(model.parameters()))
+
+
+def test(model_path, e):
+    print("===============test stage start================")
+    # test_ac_kwargs = get_agent_kwargs(args, PATH_base, train=False)
+    # test_agents = RL_Agents(building_info, observations_spaces, actions_spaces, test_ac_kwargs)
+    # print("testing: Load model from episode {}.".format(e))
+    # print("load path:{}".format(model_path))
+    # test_agents.agent.load_models(model_path, e)
+    # print_grad(test_agents.agent.actor)
+    # return
+
+    env = CityLearn(**env_kwargs)
+    state = env.reset()
+    # test_agents.agent.reset()
+
+    done = False
+    k = 0
+    # cum_reward = {}
+    # for id in range(test_agents.n_buildings):
+    #     cum_reward[id] = 0
+
+    cost = {}
+    while not done:
+        with torch.no_grad():
+            # action = test_agents.select_action(state)
+            action = np.zeros((9, 2))
+            next_state, raw_reward, done, _ = env.step(action)
+            state = next_state
+            if k % 1 == 0:
+                print("testing time step:{}, write rewards".format(k))
+                for id in range(9):
+                    # cum_reward[id] += raw_reward[id]
+                    reward_writer.add_scalar('building_reward_' + str(id), raw_reward[id], k)
+                    # act_writer.add_scalar('act1_' + str(id), action[id][0], k)
+                    # act_writer.add_scalar('act2_' + str(id), action[id][1], k)
+                    # soc_writer.add_scalar('soc1_' + str(id), state[id][-2], k)
+                    # soc_writer.add_scalar('soc2_' + str(id), state[id][-1], k)
+            k += 1
+    exit()
+    # write episode-accumulated reward
+    # for r in range(test_agents.n_buildings):
+    #     reward_writer.add_scalar('building_cum_reward_' + str(r), cum_reward[r], 0)
+
+    # write cost
+    cost[e] = env.cost()
+    print("cost_writer adding scalar")
+    for i in range(len(objective_function)):
+        cost_writer.add_scalar(str("cost_") + objective_function[i], cost[e][objective_function[i]], 0)
+        cost_writer.flush()
+
+
+test(model_path, args.load_episode)
