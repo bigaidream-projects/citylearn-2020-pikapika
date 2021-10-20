@@ -9,4 +9,4 @@ Design: Jie Fu, Bingchan Zhao, Yunbo Wang
 
 Implementation: Bingchan Zhao, Yunbo Wang
 
-Discussion: Jie Fu, Bingchan Zhao, Yunbo Wang, Hao Dong
+Discussion: Jie Fu, Bingchan Zhao, Yunbo Wang, Hao Dong, Zihan Ding
